@@ -1,0 +1,2438 @@
+        ```
+
+        packages/cli/README.md:
+        ```
+# shadcn-ui
+
+A CLI for adding components to your project.
+
+> [!WARNING]
+> The shadcn-ui CLI is going to be deprecated soon. Bug fixes and new features should be added to the `.packages/shadcn` instead.
+
+## Usage
+
+Use the `init` command to initialize dependencies for a new project.
+
+The `init` command installs dependencies, adds the `cn` util, configures `tailwind.config.js`, and CSS variables for the project.
+
+```bash
+npx shadcn-ui init
+```
+
+## add
+
+Use the `add` command to add components to your project.
+
+The `add` command adds a component to your project and installs all required dependencies.
+
+```bash
+npx shadcn-ui add [component]
+```
+
+### Example
+
+```bash
+npx shadcn-ui add alert-dialog
+```
+
+You can also run the command without any arguments to view a list of all available components:
+
+```bash
+npx shadcn-ui add
+```
+
+## Documentation
+
+Visit https://ui.shadcn.com/docs/cli to view the documentation.
+
+## License
+
+Licensed under the [MIT license](https://github.com/shadcn/ui/blob/main/LICENSE.md).
+
+        ```
+
+                packages/cli/src/commands/add.ts:
+                ```
+import { existsSync, promises as fs } from "fs"
+import path from "path"
+import { DEPRECATED_MESSAGE } from "@/src/deprecated"
+import { getConfig } from "@/src/utils/get-config"
+import { getPackageManager } from "@/src/utils/get-package-manager"
+import { handleError } from "@/src/utils/handle-error"
+import { logger } from "@/src/utils/logger"
+import {
+  fetchTree,
+  getItemTargetPath,
+  getRegistryBaseColor,
+  getRegistryIndex,
+  resolveTree,
+} from "@/src/utils/registry"
+import { transform } from "@/src/utils/transformers"
+import chalk from "chalk"
+import { Command } from "commander"
+import { execa } from "execa"
+import ora from "ora"
+import prompts from "prompts"
+import { z } from "zod"
+
+const addOptionsSchema = z.object({
+  components: z.array(z.string()).optional(),
+  yes: z.boolean(),
+  overwrite: z.boolean(),
+  cwd: z.string(),
+  all: z.boolean(),
+  path: z.string().optional(),
+})
+
+export const add = new Command()
+  .name("add")
+  .description("add a component to your project")
+  .argument("[components...]", "the components to add")
+  .option("-y, --yes", "skip confirmation prompt.", true)
+  .option("-o, --overwrite", "overwrite existing files.", false)
+  .option(
+    "-c, --cwd <cwd>",
+    "the working directory. defaults to the current directory.",
+    process.cwd()
+  )
+  .option("-a, --all", "add all available components", false)
+  .option("-p, --path <path>", "the path to add the component to.")
+  .action(async (components, opts) => {
+    try {
+      console.log(DEPRECATED_MESSAGE)
+
+      const options = addOptionsSchema.parse({
+        components,
+        ...opts,
+      })
+
+      const cwd = path.resolve(options.cwd)
+
+      if (!existsSync(cwd)) {
+        logger.error(`The path ${cwd} does not exist. Please try again.`)
+        process.exit(1)
+      }
+
+      const config = await getConfig(cwd)
+      if (!config) {
+        logger.warn(
+          `Configuration is missing. Please run ${chalk.green(
+            `init`
+          )} to create a components.json file.`
+        )
+        process.exit(1)
+      }
+
+      const registryIndex = await getRegistryIndex()
+
+      let selectedComponents = options.all
+        ? registryIndex.map((entry) => entry.name)
+        : options.components
+      if (!options.components?.length && !options.all) {
+        const { components } = await prompts({
+          type: "multiselect",
+          name: "components",
+          message: "Which components would you like to add?",
+          hint: "Space to select. A to toggle all. Enter to submit.",
+          instructions: false,
+          choices: registryIndex.map((entry) => ({
+            title: entry.name,
+            value: entry.name,
+            selected: options.all
+              ? true
+              : options.components?.includes(entry.name),
+          })),
+        })
+        selectedComponents = components
+      }
+
+      if (!selectedComponents?.length) {
+        logger.warn("No components selected. Exiting.")
+        process.exit(0)
+      }
+
+      const tree = await resolveTree(registryIndex, selectedComponents)
+      const payload = await fetchTree(config.style, tree)
+      const baseColor = await getRegistryBaseColor(config.tailwind.baseColor)
+
+      if (!payload.length) {
+        logger.warn("Selected components not found. Exiting.")
+        process.exit(0)
+      }
+
+      if (!options.yes) {
+        const { proceed } = await prompts({
+          type: "confirm",
+          name: "proceed",
+          message: `Ready to install components and dependencies. Proceed?`,
+          initial: true,
+        })
+
+        if (!proceed) {
+          process.exit(0)
+        }
+      }
+
+      const spinner = ora(`Installing components...`).start()
+      for (const item of payload) {
+        spinner.text = `Installing ${item.name}...`
+        const targetDir = await getItemTargetPath(
+          config,
+          item,
+          options.path ? path.resolve(cwd, options.path) : undefined
+        )
+
+        if (!targetDir) {
+          continue
+        }
+
+        if (!existsSync(targetDir)) {
+          await fs.mkdir(targetDir, { recursive: true })
+        }
+
+        const existingComponent = item.files.filter((file) =>
+          existsSync(path.resolve(targetDir, file.name))
+        )
+
+        if (existingComponent.length && !options.overwrite) {
+          if (selectedComponents.includes(item.name)) {
+            spinner.stop()
+            const { overwrite } = await prompts({
+              type: "confirm",
+              name: "overwrite",
+              message: `Component ${item.name} already exists. Would you like to overwrite?`,
+              initial: false,
+            })
+
+            if (!overwrite) {
+              logger.info(
+                `Skipped ${item.name}. To overwrite, run with the ${chalk.green(
+                  "--overwrite"
+                )} flag.`
+              )
+              continue
+            }
+
+            spinner.start(`Installing ${item.name}...`)
+          } else {
+            continue
+          }
+        }
+
+        for (const file of item.files) {
+          let filePath = path.resolve(targetDir, file.name)
+
+          // Run transformers.
+          const content = await transform({
+            filename: file.name,
+            raw: file.content,
+            config,
+            baseColor,
+          })
+
+          if (!config.tsx) {
+            filePath = filePath.replace(/\.tsx$/, ".jsx")
+            filePath = filePath.replace(/\.ts$/, ".js")
+          }
+
+          await fs.writeFile(filePath, content)
+        }
+
+        const packageManager = await getPackageManager(cwd)
+
+        // Install dependencies.
+        if (item.dependencies?.length) {
+          await execa(
+            packageManager,
+            [
+              packageManager === "npm" ? "install" : "add",
+              ...item.dependencies,
+            ],
+            {
+              cwd,
+            }
+          )
+        }
+
+        // Install devDependencies.
+        if (item.devDependencies?.length) {
+          await execa(
+            packageManager,
+            [
+              packageManager === "npm" ? "install" : "add",
+              "-D",
+              ...item.devDependencies,
+            ],
+            {
+              cwd,
+            }
+          )
+        }
+      }
+      spinner.succeed(`Done.`)
+    } catch (error) {
+      handleError(error)
+    }
+  })
+
+                ```
+
+                packages/cli/src/commands/diff.ts:
+                ```
+import { existsSync, promises as fs } from "fs"
+import path from "path"
+import { Config, getConfig } from "@/src/utils/get-config"
+import { handleError } from "@/src/utils/handle-error"
+import { logger } from "@/src/utils/logger"
+import {
+  fetchTree,
+  getItemTargetPath,
+  getRegistryBaseColor,
+  getRegistryIndex,
+} from "@/src/utils/registry"
+import { registryIndexSchema } from "@/src/utils/registry/schema"
+import { transform } from "@/src/utils/transformers"
+import chalk from "chalk"
+import { Command } from "commander"
+import { diffLines, type Change } from "diff"
+import { z } from "zod"
+
+const updateOptionsSchema = z.object({
+  component: z.string().optional(),
+  yes: z.boolean(),
+  cwd: z.string(),
+  path: z.string().optional(),
+})
+
+export const diff = new Command()
+  .name("diff")
+  .description("check for updates against the registry")
+  .argument("[component]", "the component name")
+  .option("-y, --yes", "skip confirmation prompt.", false)
+  .option(
+    "-c, --cwd <cwd>",
+    "the working directory. defaults to the current directory.",
+    process.cwd()
+  )
+  .action(async (name, opts) => {
+    try {
+      const options = updateOptionsSchema.parse({
+        component: name,
+        ...opts,
+      })
+
+      const cwd = path.resolve(options.cwd)
+
+      if (!existsSync(cwd)) {
+        logger.error(`The path ${cwd} does not exist. Please try again.`)
+        process.exit(1)
+      }
+
+      const config = await getConfig(cwd)
+      if (!config) {
+        logger.warn(
+          `Configuration is missing. Please run ${chalk.green(
+            `init`
+          )} to create a components.json file.`
+        )
+        process.exit(1)
+      }
+
+      const registryIndex = await getRegistryIndex()
+
+      if (!options.component) {
+        const targetDir = config.resolvedPaths.components
+
+        // Find all components that exist in the project.
+        const projectComponents = registryIndex.filter((item) => {
+          for (const file of item.files) {
+            const filePath = path.resolve(targetDir, file)
+            if (existsSync(filePath)) {
+              return true
+            }
+          }
+
+          return false
+        })
+
+        // Check for updates.
+        const componentsWithUpdates = []
+        for (const component of projectComponents) {
+          const changes = await diffComponent(component, config)
+          if (changes.length) {
+            componentsWithUpdates.push({
+              name: component.name,
+              changes,
+            })
+          }
+        }
+
+        if (!componentsWithUpdates.length) {
+          logger.info("No updates found.")
+          process.exit(0)
+        }
+
+        logger.info("The following components have updates available:")
+        for (const component of componentsWithUpdates) {
+          logger.info(`- ${component.name}`)
+          for (const change of component.changes) {
+            logger.info(`  - ${change.filePath}`)
+          }
+        }
+        logger.break()
+        logger.info(
+          `Run ${chalk.green(`diff <component>`)} to see the changes.`
+        )
+        process.exit(0)
+      }
+
+      // Show diff for a single component.
+      const component = registryIndex.find(
+        (item) => item.name === options.component
+      )
+
+      if (!component) {
+        logger.error(
+          `The component ${chalk.green(options.component)} does not exist.`
+        )
+        process.exit(1)
+      }
+
+      const changes = await diffComponent(component, config)
+
+      if (!changes.length) {
+        logger.info(`No updates found for ${options.component}.`)
+        process.exit(0)
+      }
+
+      for (const change of changes) {
+        logger.info(`- ${change.filePath}`)
+        await printDiff(change.patch)
+        logger.info("")
+      }
+    } catch (error) {
+      handleError(error)
+    }
+  })
+
+async function diffComponent(
+  component: z.infer<typeof registryIndexSchema>[number],
+  config: Config
+) {
+  const payload = await fetchTree(config.style, [component])
+  const baseColor = await getRegistryBaseColor(config.tailwind.baseColor)
+
+  const changes = []
+
+  for (const item of payload) {
+    const targetDir = await getItemTargetPath(config, item)
+
+    if (!targetDir) {
+      continue
+    }
+
+    for (const file of item.files) {
+      const filePath = path.resolve(targetDir, file.name)
+
+      if (!existsSync(filePath)) {
+        continue
+      }
+
+      const fileContent = await fs.readFile(filePath, "utf8")
+
+      const registryContent = await transform({
+        filename: file.name,
+        raw: file.content,
+        config,
+        baseColor,
+      })
+
+      const patch = diffLines(registryContent as string, fileContent)
+      if (patch.length > 1) {
+        changes.push({
+          file: file.name,
+          filePath,
+          patch,
+        })
+      }
+    }
+  }
+
+  return changes
+}
+
+async function printDiff(diff: Change[]) {
+  diff.forEach((part) => {
+    if (part) {
+      if (part.added) {
+        return process.stdout.write(chalk.green(part.value))
+      }
+      if (part.removed) {
+        return process.stdout.write(chalk.red(part.value))
+      }
+
+      return process.stdout.write(part.value)
+    }
+  })
+}
+
+                ```
+
+                packages/cli/src/commands/init.ts:
+                ```
+import { existsSync, promises as fs } from "fs"
+import path from "path"
+import { DEPRECATED_MESSAGE } from "@/src/deprecated"
+import {
+  DEFAULT_COMPONENTS,
+  DEFAULT_TAILWIND_CONFIG,
+  DEFAULT_TAILWIND_CSS,
+  DEFAULT_UTILS,
+  getConfig,
+  rawConfigSchema,
+  resolveConfigPaths,
+  type Config,
+} from "@/src/utils/get-config"
+import { getPackageManager } from "@/src/utils/get-package-manager"
+import { getProjectConfig, preFlight } from "@/src/utils/get-project-info"
+import { handleError } from "@/src/utils/handle-error"
+import { logger } from "@/src/utils/logger"
+import {
+  getRegistryBaseColor,
+  getRegistryBaseColors,
+  getRegistryStyles,
+} from "@/src/utils/registry"
+import * as templates from "@/src/utils/templates"
+import chalk from "chalk"
+import { Command } from "commander"
+import { execa } from "execa"
+import template from "lodash.template"
+import ora from "ora"
+import prompts from "prompts"
+import { z } from "zod"
+
+import { applyPrefixesCss } from "../utils/transformers/transform-tw-prefix"
+
+const PROJECT_DEPENDENCIES = [
+  "tailwindcss-animate",
+  "class-variance-authority",
+  "clsx",
+  "tailwind-merge",
+]
+
+const initOptionsSchema = z.object({
+  cwd: z.string(),
+  yes: z.boolean(),
+  defaults: z.boolean(),
+})
+
+export const init = new Command()
+  .name("init")
+  .description("initialize your project and install dependencies")
+  .option("-y, --yes", "skip confirmation prompt.", false)
+  .option("-d, --defaults,", "use default configuration.", false)
+  .option(
+    "-c, --cwd <cwd>",
+    "the working directory. defaults to the current directory.",
+    process.cwd()
+  )
+  .action(async (opts) => {
+    try {
+      console.log(DEPRECATED_MESSAGE)
+
+      const options = initOptionsSchema.parse(opts)
+      const cwd = path.resolve(options.cwd)
+
+      // Ensure target directory exists.
+      if (!existsSync(cwd)) {
+        logger.error(`The path ${cwd} does not exist. Please try again.`)
+        process.exit(1)
+      }
+
+      preFlight(cwd)
+
+      const projectConfig = await getProjectConfig(cwd)
+      if (projectConfig) {
+        const config = await promptForMinimalConfig(
+          cwd,
+          projectConfig,
+          opts.defaults
+        )
+        await runInit(cwd, config)
+      } else {
+        // Read config.
+        const existingConfig = await getConfig(cwd)
+        const config = await promptForConfig(cwd, existingConfig, options.yes)
+        await runInit(cwd, config)
+      }
+
+      logger.info("")
+      logger.info(
+        `${chalk.green(
+          "Success!"
+        )} Project initialization completed. You may now add components.`
+      )
+      logger.info("")
+    } catch (error) {
+      handleError(error)
+    }
+  })
+
+export async function promptForConfig(
+  cwd: string,
+  defaultConfig: Config | null = null,
+  skip = false
+) {
+  const highlight = (text: string) => chalk.cyan(text)
+
+  const styles = await getRegistryStyles()
+  const baseColors = await getRegistryBaseColors()
+
+  const options = await prompts([
+    {
+      type: "toggle",
+      name: "typescript",
+      message: `Would you like to use ${highlight(
+        "TypeScript"
+      )} (recommended)?`,
+      initial: defaultConfig?.tsx ?? true,
+      active: "yes",
+      inactive: "no",
+    },
+    {
+      type: "select",
+      name: "style",
+      message: `Which ${highlight("style")} would you like to use?`,
+      choices: styles.map((style) => ({
+        title: style.label,
+        value: style.name,
+      })),
+    },
+    {
+      type: "select",
+      name: "tailwindBaseColor",
+      message: `Which color would you like to use as ${highlight(
+        "base color"
+      )}?`,
+      choices: baseColors.map((color) => ({
+        title: color.label,
+        value: color.name,
+      })),
+    },
+    {
+      type: "text",
+      name: "tailwindCss",
+      message: `Where is your ${highlight("global CSS")} file?`,
+      initial: defaultConfig?.tailwind.css ?? DEFAULT_TAILWIND_CSS,
+    },
+    {
+      type: "toggle",
+      name: "tailwindCssVariables",
+      message: `Would you like to use ${highlight(
+        "CSS variables"
+      )} for colors?`,
+      initial: defaultConfig?.tailwind.cssVariables ?? true,
+      active: "yes",
+      inactive: "no",
+    },
+    {
+      type: "text",
+      name: "tailwindPrefix",
+      message: `Are you using a custom ${highlight(
+        "tailwind prefix eg. tw-"
+      )}? (Leave blank if not)`,
+      initial: "",
+    },
+    {
+      type: "text",
+      name: "tailwindConfig",
+      message: `Where is your ${highlight("tailwind.config.js")} located?`,
+      initial: defaultConfig?.tailwind.config ?? DEFAULT_TAILWIND_CONFIG,
+    },
+    {
+      type: "text",
+      name: "components",
+      message: `Configure the import alias for ${highlight("components")}:`,
+      initial: defaultConfig?.aliases["components"] ?? DEFAULT_COMPONENTS,
+    },
+    {
+      type: "text",
+      name: "utils",
+      message: `Configure the import alias for ${highlight("utils")}:`,
+      initial: defaultConfig?.aliases["utils"] ?? DEFAULT_UTILS,
+    },
+    {
+      type: "toggle",
+      name: "rsc",
+      message: `Are you using ${highlight("React Server Components")}?`,
+      initial: defaultConfig?.rsc ?? true,
+      active: "yes",
+      inactive: "no",
+    },
+  ])
+
+  const config = rawConfigSchema.parse({
+    $schema: "https://ui.shadcn.com/schema.json",
+    style: options.style,
+    tailwind: {
+      config: options.tailwindConfig,
+      css: options.tailwindCss,
+      baseColor: options.tailwindBaseColor,
+      cssVariables: options.tailwindCssVariables,
+      prefix: options.tailwindPrefix,
+    },
+    rsc: options.rsc,
+    tsx: options.typescript,
+    aliases: {
+      utils: options.utils,
+      components: options.components,
+    },
+  })
+
+  if (!skip) {
+    const { proceed } = await prompts({
+      type: "confirm",
+      name: "proceed",
+      message: `Write configuration to ${highlight(
+        "components.json"
+      )}. Proceed?`,
+      initial: true,
+    })
+
+    if (!proceed) {
+      process.exit(0)
+    }
+  }
+
+  // Write to file.
+  logger.info("")
+  const spinner = ora(`Writing components.json...`).start()
+  const targetPath = path.resolve(cwd, "components.json")
+  await fs.writeFile(targetPath, JSON.stringify(config, null, 2), "utf8")
+  spinner.succeed()
+
+  return await resolveConfigPaths(cwd, config)
+}
+
+export async function promptForMinimalConfig(
+  cwd: string,
+  defaultConfig: Config,
+  defaults = false
+) {
+  const highlight = (text: string) => chalk.cyan(text)
+  let style = defaultConfig.style
+  let baseColor = defaultConfig.tailwind.baseColor
+  let cssVariables = defaultConfig.tailwind.cssVariables
+
+  if (!defaults) {
+    const styles = await getRegistryStyles()
+    const baseColors = await getRegistryBaseColors()
+
+    const options = await prompts([
+      {
+        type: "select",
+        name: "style",
+        message: `Which ${highlight("style")} would you like to use?`,
+        choices: styles.map((style) => ({
+          title: style.label,
+          value: style.name,
+        })),
+      },
+      {
+        type: "select",
+        name: "tailwindBaseColor",
+        message: `Which color would you like to use as ${highlight(
+          "base color"
+        )}?`,
+        choices: baseColors.map((color) => ({
+          title: color.label,
+          value: color.name,
+        })),
+      },
+      {
+        type: "toggle",
+        name: "tailwindCssVariables",
+        message: `Would you like to use ${highlight(
+          "CSS variables"
+        )} for colors?`,
+        initial: defaultConfig?.tailwind.cssVariables,
+        active: "yes",
+        inactive: "no",
+      },
+    ])
+
+    style = options.style
+    baseColor = options.tailwindBaseColor
+    cssVariables = options.tailwindCssVariables
+  }
+
+  const config = rawConfigSchema.parse({
+    $schema: defaultConfig?.$schema,
+    style,
+    tailwind: {
+      ...defaultConfig?.tailwind,
+      baseColor,
+      cssVariables,
+    },
+    rsc: defaultConfig?.rsc,
+    tsx: defaultConfig?.tsx,
+    aliases: defaultConfig?.aliases,
+  })
+
+  // Write to file.
+  logger.info("")
+  const spinner = ora(`Writing components.json...`).start()
+  const targetPath = path.resolve(cwd, "components.json")
+  await fs.writeFile(targetPath, JSON.stringify(config, null, 2), "utf8")
+  spinner.succeed()
+
+  return await resolveConfigPaths(cwd, config)
+}
+
+export async function runInit(cwd: string, config: Config) {
+  const spinner = ora(`Initializing project...`)?.start()
+
+  // Ensure all resolved paths directories exist.
+  for (const [key, resolvedPath] of Object.entries(config.resolvedPaths)) {
+    // Determine if the path is a file or directory.
+    // TODO: is there a better way to do this?
+    let dirname = path.extname(resolvedPath)
+      ? path.dirname(resolvedPath)
+      : resolvedPath
+
+    // If the utils alias is set to something like "@/lib/utils",
+    // assume this is a file and remove the "utils" file name.
+    // TODO: In future releases we should add support for individual utils.
+    if (key === "utils" && resolvedPath.endsWith("/utils")) {
+      // Remove /utils at the end.
+      dirname = dirname.replace(/\/utils$/, "")
+    }
+
+    if (!existsSync(dirname)) {
+      await fs.mkdir(dirname, { recursive: true })
+    }
+  }
+
+  const extension = config.tsx ? "ts" : "js"
+
+  const tailwindConfigExtension = path.extname(
+    config.resolvedPaths.tailwindConfig
+  )
+
+  let tailwindConfigTemplate: string
+  if (tailwindConfigExtension === ".ts") {
+    tailwindConfigTemplate = config.tailwind.cssVariables
+      ? templates.TAILWIND_CONFIG_TS_WITH_VARIABLES
+      : templates.TAILWIND_CONFIG_TS
+  } else {
+    tailwindConfigTemplate = config.tailwind.cssVariables
+      ? templates.TAILWIND_CONFIG_WITH_VARIABLES
+      : templates.TAILWIND_CONFIG
+  }
+
+  // Write tailwind config.
+  await fs.writeFile(
+    config.resolvedPaths.tailwindConfig,
+    template(tailwindConfigTemplate)({
+      extension,
+      prefix: config.tailwind.prefix,
+    }),
+    "utf8"
+  )
+
+  // Write css file.
+  const baseColor = await getRegistryBaseColor(config.tailwind.baseColor)
+  if (baseColor) {
+    await fs.writeFile(
+      config.resolvedPaths.tailwindCss,
+      config.tailwind.cssVariables
+        ? config.tailwind.prefix
+          ? applyPrefixesCss(baseColor.cssVarsTemplate, config.tailwind.prefix)
+          : baseColor.cssVarsTemplate
+        : baseColor.inlineColorsTemplate,
+      "utf8"
+    )
+  }
+
+  // Write cn file.
+  await fs.writeFile(
+    `${config.resolvedPaths.utils}.${extension}`,
+    extension === "ts" ? templates.UTILS : templates.UTILS_JS,
+    "utf8"
+  )
+
+  spinner?.succeed()
+
+  // Install dependencies.
+  const dependenciesSpinner = ora(`Installing dependencies...`)?.start()
+  const packageManager = await getPackageManager(cwd)
+
+  // TODO: add support for other icon libraries.
+  const deps = [
+    ...PROJECT_DEPENDENCIES,
+    config.style === "new-york" ? "@radix-ui/react-icons" : "lucide-react",
+  ]
+
+  await execa(
+    packageManager,
+    [packageManager === "npm" ? "install" : "add", ...deps],
+    {
+      cwd,
+    }
+  )
+  dependenciesSpinner?.succeed()
+}
+
+                ```
+
+            packages/cli/src/deprecated.ts:
+            ```
+import chalk from "chalk"
+
+export const DEPRECATED_MESSAGE = chalk.yellow(
+  `\nNote: The shadcn-ui CLI is going to be deprecated soon. Please use ${chalk.bold(
+    "npx shadcn"
+  )} instead.\n`
+)
+
+            ```
+
+            packages/cli/src/index.ts:
+            ```
+#!/usr/bin/env node
+import { add } from "@/src/commands/add"
+import { diff } from "@/src/commands/diff"
+import { init } from "@/src/commands/init"
+import { Command } from "commander"
+
+import { DEPRECATED_MESSAGE } from "./deprecated"
+import { getPackageInfo } from "./utils/get-package-info"
+
+process.on("SIGINT", () => process.exit(0))
+process.on("SIGTERM", () => process.exit(0))
+
+async function main() {
+  const packageInfo = await getPackageInfo()
+
+  const program = new Command()
+    .name("shadcn-ui")
+    .description("add components and dependencies to your project")
+    .addHelpText("after", DEPRECATED_MESSAGE)
+    .version(
+      packageInfo.version || "1.0.0",
+      "-v, --version",
+      "display the version number"
+    )
+
+  program.addCommand(init).addCommand(add).addCommand(diff)
+
+  program.parse()
+}
+
+main()
+
+            ```
+
+                packages/cli/src/utils/get-config.ts:
+                ```
+import path from "path"
+import { resolveImport } from "@/src/utils/resolve-import"
+import { cosmiconfig } from "cosmiconfig"
+import { loadConfig } from "tsconfig-paths"
+import { z } from "zod"
+
+export const DEFAULT_STYLE = "default"
+export const DEFAULT_COMPONENTS = "@/components"
+export const DEFAULT_UTILS = "@/lib/utils"
+export const DEFAULT_TAILWIND_CSS = "app/globals.css"
+export const DEFAULT_TAILWIND_CONFIG = "tailwind.config.js"
+export const DEFAULT_TAILWIND_BASE_COLOR = "slate"
+
+// TODO: Figure out if we want to support all cosmiconfig formats.
+// A simple components.json file would be nice.
+const explorer = cosmiconfig("components", {
+  searchPlaces: ["components.json"],
+})
+
+export const rawConfigSchema = z
+  .object({
+    $schema: z.string().optional(),
+    style: z.string(),
+    rsc: z.coerce.boolean().default(false),
+    tsx: z.coerce.boolean().default(true),
+    tailwind: z.object({
+      config: z.string(),
+      css: z.string(),
+      baseColor: z.string(),
+      cssVariables: z.boolean().default(true),
+      prefix: z.string().default("").optional(),
+    }),
+    aliases: z.object({
+      components: z.string(),
+      utils: z.string(),
+      ui: z.string().optional(),
+    }),
+  })
+  .strict()
+
+export type RawConfig = z.infer<typeof rawConfigSchema>
+
+export const configSchema = rawConfigSchema.extend({
+  resolvedPaths: z.object({
+    tailwindConfig: z.string(),
+    tailwindCss: z.string(),
+    utils: z.string(),
+    components: z.string(),
+    ui: z.string(),
+  }),
+})
+
+export type Config = z.infer<typeof configSchema>
+
+export async function getConfig(cwd: string) {
+  const config = await getRawConfig(cwd)
+
+  if (!config) {
+    return null
+  }
+
+  return await resolveConfigPaths(cwd, config)
+}
+
+export async function resolveConfigPaths(cwd: string, config: RawConfig) {
+  // Read tsconfig.json.
+  const tsConfig = await loadConfig(cwd)
+
+  if (tsConfig.resultType === "failed") {
+    throw new Error(
+      `Failed to load ${config.tsx ? "tsconfig" : "jsconfig"}.json. ${
+        tsConfig.message ?? ""
+      }`.trim()
+    )
+  }
+
+  return configSchema.parse({
+    ...config,
+    resolvedPaths: {
+      tailwindConfig: path.resolve(cwd, config.tailwind.config),
+      tailwindCss: path.resolve(cwd, config.tailwind.css),
+      utils: await resolveImport(config.aliases["utils"], tsConfig),
+      components: await resolveImport(config.aliases["components"], tsConfig),
+      ui: config.aliases["ui"]
+        ? await resolveImport(config.aliases["ui"], tsConfig)
+        : await resolveImport(config.aliases["components"], tsConfig),
+    },
+  })
+}
+
+export async function getRawConfig(cwd: string): Promise<RawConfig | null> {
+  try {
+    const configResult = await explorer.search(cwd)
+
+    if (!configResult) {
+      return null
+    }
+
+    return rawConfigSchema.parse(configResult.config)
+  } catch (error) {
+    throw new Error(`Invalid configuration found in ${cwd}/components.json.`)
+  }
+}
+
+                ```
+
+                packages/cli/src/utils/get-package-info.ts:
+                ```
+import path from "path"
+import fs from "fs-extra"
+import { type PackageJson } from "type-fest"
+
+export function getPackageInfo() {
+  const packageJsonPath = path.join("package.json")
+
+  return fs.readJSONSync(packageJsonPath) as PackageJson
+}
+
+                ```
+
+                packages/cli/src/utils/get-package-manager.ts:
+                ```
+import { detect } from "@antfu/ni"
+
+export async function getPackageManager(
+  targetDir: string
+): Promise<"yarn" | "pnpm" | "bun" | "npm"> {
+  const packageManager = await detect({ programmatic: true, cwd: targetDir })
+
+  if (packageManager === "yarn@berry") return "yarn"
+  if (packageManager === "pnpm@6") return "pnpm"
+  if (packageManager === "bun") return "bun"
+
+  return packageManager ?? "npm"
+}
+
+                ```
+
+                packages/cli/src/utils/get-project-info.ts:
+                ```
+import { existsSync } from "fs"
+import path from "path"
+import {
+  Config,
+  RawConfig,
+  getConfig,
+  resolveConfigPaths,
+} from "@/src/utils/get-config"
+import fg from "fast-glob"
+import fs, { pathExists } from "fs-extra"
+import { loadConfig } from "tsconfig-paths"
+
+// TODO: Add support for more frameworks.
+// We'll start with Next.js for now.
+const PROJECT_TYPES = [
+  "next-app",
+  "next-app-src",
+  "next-pages",
+  "next-pages-src",
+] as const
+
+type ProjectType = (typeof PROJECT_TYPES)[number]
+
+const PROJECT_SHARED_IGNORE = [
+  "**/node_modules/**",
+  ".next",
+  "public",
+  "dist",
+  "build",
+]
+
+export async function getProjectInfo() {
+  const info = {
+    tsconfig: null,
+    srcDir: false,
+    appDir: false,
+    srcComponentsUiDir: false,
+    componentsUiDir: false,
+  }
+
+  try {
+    const tsconfig = await getTsConfig()
+
+    return {
+      tsconfig,
+      srcDir: existsSync(path.resolve("./src")),
+      appDir:
+        existsSync(path.resolve("./app")) ||
+        existsSync(path.resolve("./src/app")),
+      srcComponentsUiDir: existsSync(path.resolve("./src/components/ui")),
+      componentsUiDir: existsSync(path.resolve("./components/ui")),
+    }
+  } catch (error) {
+    return info
+  }
+}
+
+export async function getTsConfig() {
+  try {
+    const tsconfigPath = path.join("tsconfig.json")
+    const tsconfig = await fs.readJSON(tsconfigPath)
+
+    if (!tsconfig) {
+      throw new Error("tsconfig.json is missing")
+    }
+
+    return tsconfig
+  } catch (error) {
+    return null
+  }
+}
+
+export async function getProjectConfig(cwd: string): Promise<Config | null> {
+  // Check for existing component config.
+  const existingConfig = await getConfig(cwd)
+  if (existingConfig) {
+    return existingConfig
+  }
+
+  const projectType = await getProjectType(cwd)
+  const tailwindCssFile = await getTailwindCssFile(cwd)
+  const tsConfigAliasPrefix = await getTsConfigAliasPrefix(cwd)
+
+  if (!projectType || !tailwindCssFile || !tsConfigAliasPrefix) {
+    return null
+  }
+
+  const isTsx = await isTypeScriptProject(cwd)
+
+  const config: RawConfig = {
+    $schema: "https://ui.shadcn.com/schema.json",
+    rsc: ["next-app", "next-app-src"].includes(projectType),
+    tsx: isTsx,
+    style: "new-york",
+    tailwind: {
+      config: isTsx ? "tailwind.config.ts" : "tailwind.config.js",
+      baseColor: "zinc",
+      css: tailwindCssFile,
+      cssVariables: true,
+      prefix: "",
+    },
+    aliases: {
+      utils: `${tsConfigAliasPrefix}/lib/utils`,
+      components: `${tsConfigAliasPrefix}/components`,
+    },
+  }
+
+  return await resolveConfigPaths(cwd, config)
+}
+
+export async function getProjectType(cwd: string): Promise<ProjectType | null> {
+  const files = await fg.glob("**/*", {
+    cwd,
+    deep: 3,
+    ignore: PROJECT_SHARED_IGNORE,
+  })
+
+  const isNextProject = files.find((file) => file.startsWith("next.config."))
+  if (!isNextProject) {
+    return null
+  }
+
+  const isUsingSrcDir = await fs.pathExists(path.resolve(cwd, "src"))
+  const isUsingAppDir = await fs.pathExists(
+    path.resolve(cwd, `${isUsingSrcDir ? "src/" : ""}app`)
+  )
+
+  if (isUsingAppDir) {
+    return isUsingSrcDir ? "next-app-src" : "next-app"
+  }
+
+  return isUsingSrcDir ? "next-pages-src" : "next-pages"
+}
+
+export async function getTailwindCssFile(cwd: string) {
+  const files = await fg.glob(["**/*.css", "**/*.scss"], {
+    cwd,
+    deep: 3,
+    ignore: PROJECT_SHARED_IGNORE,
+  })
+
+  if (!files.length) {
+    return null
+  }
+
+  for (const file of files) {
+    const contents = await fs.readFile(path.resolve(cwd, file), "utf8")
+    // Assume that if the file contains `@tailwind base` it's the main css file.
+    if (contents.includes("@tailwind base")) {
+      return file
+    }
+  }
+
+  return null
+}
+
+export async function getTsConfigAliasPrefix(cwd: string) {
+  const tsConfig = await loadConfig(cwd)
+
+  if (tsConfig?.resultType === "failed" || !tsConfig?.paths) {
+    return null
+  }
+
+  // This assume that the first alias is the prefix.
+  for (const [alias, paths] of Object.entries(tsConfig.paths)) {
+    if (paths.includes("./*") || paths.includes("./src/*")) {
+      return alias.at(0)
+    }
+  }
+
+  return null
+}
+
+export async function isTypeScriptProject(cwd: string) {
+  // Check if cwd has a tsconfig.json file.
+  return pathExists(path.resolve(cwd, "tsconfig.json"))
+}
+
+export async function preFlight(cwd: string) {
+  // We need Tailwind CSS to be configured.
+  const tailwindConfig = await fg.glob("tailwind.config.*", {
+    cwd,
+    deep: 3,
+    ignore: PROJECT_SHARED_IGNORE,
+  })
+
+  if (!tailwindConfig.length) {
+    throw new Error(
+      "Tailwind CSS is not installed. Visit https://tailwindcss.com/docs/installation to get started."
+    )
+  }
+
+  return true
+}
+
+                ```
+
+                packages/cli/src/utils/handle-error.ts:
+                ```
+import { logger } from "@/src/utils/logger"
+
+export function handleError(error: unknown) {
+  if (typeof error === "string") {
+    logger.error(error)
+    process.exit(1)
+  }
+
+  if (error instanceof Error) {
+    logger.error(error.message)
+    process.exit(1)
+  }
+
+  logger.error("Something went wrong. Please try again.")
+  process.exit(1)
+}
+
+                ```
+
+                packages/cli/src/utils/logger.ts:
+                ```
+import chalk from "chalk"
+
+export const logger = {
+  error(...args: unknown[]) {
+    console.log(chalk.red(...args))
+  },
+  warn(...args: unknown[]) {
+    console.log(chalk.yellow(...args))
+  },
+  info(...args: unknown[]) {
+    console.log(chalk.cyan(...args))
+  },
+  success(...args: unknown[]) {
+    console.log(chalk.green(...args))
+  },
+  break() {
+    console.log("")
+  },
+}
+
+                ```
+
+                    packages/cli/src/utils/registry/index.ts:
+                    ```
+import path from "path"
+import { Config } from "@/src/utils/get-config"
+import {
+  registryBaseColorSchema,
+  registryIndexSchema,
+  registryItemWithContentSchema,
+  registryWithContentSchema,
+  stylesSchema,
+} from "@/src/utils/registry/schema"
+import { HttpsProxyAgent } from "https-proxy-agent"
+import fetch from "node-fetch"
+import { z } from "zod"
+
+const baseUrl = process.env.COMPONENTS_REGISTRY_URL ?? "https://ui.shadcn.com"
+const agent = process.env.https_proxy
+  ? new HttpsProxyAgent(process.env.https_proxy)
+  : undefined
+
+export async function getRegistryIndex() {
+  try {
+    const [result] = await fetchRegistry(["index.json"])
+
+    return registryIndexSchema.parse(result)
+  } catch (error) {
+    throw new Error(`Failed to fetch components from registry.`)
+  }
+}
+
+export async function getRegistryStyles() {
+  try {
+    const [result] = await fetchRegistry(["styles/index.json"])
+
+    return stylesSchema.parse(result)
+  } catch (error) {
+    throw new Error(`Failed to fetch styles from registry.`)
+  }
+}
+
+export async function getRegistryBaseColors() {
+  return [
+    {
+      name: "slate",
+      label: "Slate",
+    },
+    {
+      name: "gray",
+      label: "Gray",
+    },
+    {
+      name: "zinc",
+      label: "Zinc",
+    },
+    {
+      name: "neutral",
+      label: "Neutral",
+    },
+    {
+      name: "stone",
+      label: "Stone",
+    },
+  ]
+}
+
+export async function getRegistryBaseColor(baseColor: string) {
+  try {
+    const [result] = await fetchRegistry([`colors/${baseColor}.json`])
+
+    return registryBaseColorSchema.parse(result)
+  } catch (error) {
+    throw new Error(`Failed to fetch base color from registry.`)
+  }
+}
+
+export async function resolveTree(
+  index: z.infer<typeof registryIndexSchema>,
+  names: string[]
+) {
+  const tree: z.infer<typeof registryIndexSchema> = []
+
+  for (const name of names) {
+    const entry = index.find((entry) => entry.name === name)
+
+    if (!entry) {
+      continue
+    }
+
+    tree.push(entry)
+
+    if (entry.registryDependencies) {
+      const dependencies = await resolveTree(index, entry.registryDependencies)
+      tree.push(...dependencies)
+    }
+  }
+
+  return tree.filter(
+    (component, index, self) =>
+      self.findIndex((c) => c.name === component.name) === index
+  )
+}
+
+export async function fetchTree(
+  style: string,
+  tree: z.infer<typeof registryIndexSchema>
+) {
+  try {
+    const paths = tree.map((item) => `styles/${style}/${item.name}.json`)
+    const result = await fetchRegistry(paths)
+
+    return registryWithContentSchema.parse(result)
+  } catch (error) {
+    throw new Error(`Failed to fetch tree from registry.`)
+  }
+}
+
+export async function getItemTargetPath(
+  config: Config,
+  item: Pick<z.infer<typeof registryItemWithContentSchema>, "type">,
+  override?: string
+) {
+  if (override) {
+    return override
+  }
+
+  if (item.type === "components:ui" && config.aliases.ui) {
+    return config.resolvedPaths.ui
+  }
+
+  const [parent, type] = item.type.split(":")
+  if (!(parent in config.resolvedPaths)) {
+    return null
+  }
+
+  return path.join(
+    config.resolvedPaths[parent as keyof typeof config.resolvedPaths],
+    type
+  )
+}
+
+async function fetchRegistry(paths: string[]) {
+  try {
+    const results = await Promise.all(
+      paths.map(async (path) => {
+        const response = await fetch(`${baseUrl}/registry/${path}`, {
+          agent,
+        })
+        return await response.json()
+      })
+    )
+
+    return results
+  } catch (error) {
+    console.log(error)
+    throw new Error(`Failed to fetch registry from ${baseUrl}.`)
+  }
+}
+
+                    ```
+
+                    packages/cli/src/utils/registry/schema.ts:
+                    ```
+import { z } from "zod"
+
+// TODO: Extract this to a shared package.
+export const registryItemSchema = z.object({
+  name: z.string(),
+  dependencies: z.array(z.string()).optional(),
+  devDependencies: z.array(z.string()).optional(),
+  registryDependencies: z.array(z.string()).optional(),
+  files: z.array(z.string()),
+  type: z.enum(["components:ui", "components:component", "components:example"]),
+})
+
+export const registryIndexSchema = z.array(registryItemSchema)
+
+export const registryItemWithContentSchema = registryItemSchema.extend({
+  files: z.array(
+    z.object({
+      name: z.string(),
+      content: z.string(),
+    })
+  ),
+})
+
+export const registryWithContentSchema = z.array(registryItemWithContentSchema)
+
+export const stylesSchema = z.array(
+  z.object({
+    name: z.string(),
+    label: z.string(),
+  })
+)
+
+export const registryBaseColorSchema = z.object({
+  inlineColors: z.object({
+    light: z.record(z.string(), z.string()),
+    dark: z.record(z.string(), z.string()),
+  }),
+  cssVars: z.object({
+    light: z.record(z.string(), z.string()),
+    dark: z.record(z.string(), z.string()),
+  }),
+  inlineColorsTemplate: z.string(),
+  cssVarsTemplate: z.string(),
+})
+
+                    ```
+
+                packages/cli/src/utils/resolve-import.ts:
+                ```
+import { createMatchPath, type ConfigLoaderSuccessResult } from "tsconfig-paths"
+
+export async function resolveImport(
+  importPath: string,
+  config: Pick<ConfigLoaderSuccessResult, "absoluteBaseUrl" | "paths">
+) {
+  return createMatchPath(config.absoluteBaseUrl, config.paths)(
+    importPath,
+    undefined,
+    () => true,
+    [".ts", ".tsx"]
+  )
+}
+
+                ```
+
+                packages/cli/src/utils/templates.ts:
+                ```
+export const UTILS = `import { type ClassValue, clsx } from "clsx"
+import { twMerge } from "tailwind-merge"
+
+export function cn(...inputs: ClassValue[]) {
+  return twMerge(clsx(inputs))
+}
+`
+
+export const UTILS_JS = `import { clsx } from "clsx"
+import { twMerge } from "tailwind-merge"
+
+export function cn(...inputs) {
+  return twMerge(clsx(inputs))
+}
+`
+
+export const TAILWIND_CONFIG = `/** @type {import('tailwindcss').Config} */
+module.exports = {
+  darkMode: ["class"],
+  content: [
+    './pages/**/*.{<%- extension %>,<%- extension %>x}',
+    './components/**/*.{<%- extension %>,<%- extension %>x}',
+    './app/**/*.{<%- extension %>,<%- extension %>x}',
+    './src/**/*.{<%- extension %>,<%- extension %>x}',
+  ],
+  prefix: "<%- prefix %>",
+  theme: {
+    container: {
+      center: true,
+      padding: "2rem",
+      screens: {
+        "2xl": "1400px",
+      },
+    },
+    extend: {
+      keyframes: {
+        "accordion-down": {
+          from: { height: "0" },
+          to: { height: "var(--radix-accordion-content-height)" },
+        },
+        "accordion-up": {
+          from: { height: "var(--radix-accordion-content-height)" },
+          to: { height: "0" },
+        },
+      },
+      animation: {
+        "accordion-down": "accordion-down 0.2s ease-out",
+        "accordion-up": "accordion-up 0.2s ease-out",
+      },
+    },
+  },
+  plugins: [require("tailwindcss-animate")],
+}`
+
+export const TAILWIND_CONFIG_WITH_VARIABLES = `/** @type {import('tailwindcss').Config} */
+module.exports = {
+  darkMode: ["class"],
+  content: [
+    './pages/**/*.{<%- extension %>,<%- extension %>x}',
+    './components/**/*.{<%- extension %>,<%- extension %>x}',
+    './app/**/*.{<%- extension %>,<%- extension %>x}',
+    './src/**/*.{<%- extension %>,<%- extension %>x}',
+  ],
+  prefix: "<%- prefix %>",
+  theme: {
+    container: {
+      center: true,
+      padding: "2rem",
+      screens: {
+        "2xl": "1400px",
+      },
+    },
+    extend: {
+      colors: {
+        border: "hsl(var(--border))",
+        input: "hsl(var(--input))",
+        ring: "hsl(var(--ring))",
+        background: "hsl(var(--background))",
+        foreground: "hsl(var(--foreground))",
+        primary: {
+          DEFAULT: "hsl(var(--primary))",
+          foreground: "hsl(var(--primary-foreground))",
+        },
+        secondary: {
+          DEFAULT: "hsl(var(--secondary))",
+          foreground: "hsl(var(--secondary-foreground))",
+        },
+        destructive: {
+          DEFAULT: "hsl(var(--destructive))",
+          foreground: "hsl(var(--destructive-foreground))",
+        },
+        muted: {
+          DEFAULT: "hsl(var(--muted))",
+          foreground: "hsl(var(--muted-foreground))",
+        },
+        accent: {
+          DEFAULT: "hsl(var(--accent))",
+          foreground: "hsl(var(--accent-foreground))",
+        },
+        popover: {
+          DEFAULT: "hsl(var(--popover))",
+          foreground: "hsl(var(--popover-foreground))",
+        },
+        card: {
+          DEFAULT: "hsl(var(--card))",
+          foreground: "hsl(var(--card-foreground))",
+        },
+      },
+      borderRadius: {
+        lg: "var(--radius)",
+        md: "calc(var(--radius) - 2px)",
+        sm: "calc(var(--radius) - 4px)",
+      },
+      keyframes: {
+        "accordion-down": {
+          from: { height: "0" },
+          to: { height: "var(--radix-accordion-content-height)" },
+        },
+        "accordion-up": {
+          from: { height: "var(--radix-accordion-content-height)" },
+          to: { height: "0" },
+        },
+      },
+      animation: {
+        "accordion-down": "accordion-down 0.2s ease-out",
+        "accordion-up": "accordion-up 0.2s ease-out",
+      },
+    },
+  },
+  plugins: [require("tailwindcss-animate")],
+}`
+
+export const TAILWIND_CONFIG_TS = `import type { Config } from "tailwindcss"
+
+const config = {
+  darkMode: ["class"],
+  content: [
+    './pages/**/*.{<%- extension %>,<%- extension %>x}',
+    './components/**/*.{<%- extension %>,<%- extension %>x}',
+    './app/**/*.{<%- extension %>,<%- extension %>x}',
+    './src/**/*.{<%- extension %>,<%- extension %>x}',
+  ],
+  prefix: "<%- prefix %>",
+  theme: {
+    container: {
+      center: true,
+      padding: "2rem",
+      screens: {
+        "2xl": "1400px",
+      },
+    },
+    extend: {
+      keyframes: {
+        "accordion-down": {
+          from: { height: "0" },
+          to: { height: "var(--radix-accordion-content-height)" },
+        },
+        "accordion-up": {
+          from: { height: "var(--radix-accordion-content-height)" },
+          to: { height: "0" },
+        },
+      },
+      animation: {
+        "accordion-down": "accordion-down 0.2s ease-out",
+        "accordion-up": "accordion-up 0.2s ease-out",
+      },
+    },
+  },
+  plugins: [require("tailwindcss-animate")],
+} satisfies Config
+
+export default config`
+
+export const TAILWIND_CONFIG_TS_WITH_VARIABLES = `import type { Config } from "tailwindcss"
+
+const config = {
+  darkMode: ["class"],
+  content: [
+    './pages/**/*.{<%- extension %>,<%- extension %>x}',
+    './components/**/*.{<%- extension %>,<%- extension %>x}',
+    './app/**/*.{<%- extension %>,<%- extension %>x}',
+    './src/**/*.{<%- extension %>,<%- extension %>x}',
+	],
+  prefix: "<%- prefix %>",
+  theme: {
+    container: {
+      center: true,
+      padding: "2rem",
+      screens: {
+        "2xl": "1400px",
+      },
+    },
+    extend: {
+      colors: {
+        border: "hsl(var(--border))",
+        input: "hsl(var(--input))",
+        ring: "hsl(var(--ring))",
+        background: "hsl(var(--background))",
+        foreground: "hsl(var(--foreground))",
+        primary: {
+          DEFAULT: "hsl(var(--primary))",
+          foreground: "hsl(var(--primary-foreground))",
+        },
+        secondary: {
+          DEFAULT: "hsl(var(--secondary))",
+          foreground: "hsl(var(--secondary-foreground))",
+        },
+        destructive: {
+          DEFAULT: "hsl(var(--destructive))",
+          foreground: "hsl(var(--destructive-foreground))",
+        },
+        muted: {
+          DEFAULT: "hsl(var(--muted))",
+          foreground: "hsl(var(--muted-foreground))",
+        },
+        accent: {
+          DEFAULT: "hsl(var(--accent))",
+          foreground: "hsl(var(--accent-foreground))",
+        },
+        popover: {
+          DEFAULT: "hsl(var(--popover))",
+          foreground: "hsl(var(--popover-foreground))",
+        },
+        card: {
+          DEFAULT: "hsl(var(--card))",
+          foreground: "hsl(var(--card-foreground))",
+        },
+      },
+      borderRadius: {
+        lg: "var(--radius)",
+        md: "calc(var(--radius) - 2px)",
+        sm: "calc(var(--radius) - 4px)",
+      },
+      keyframes: {
+        "accordion-down": {
+          from: { height: "0" },
+          to: { height: "var(--radix-accordion-content-height)" },
+        },
+        "accordion-up": {
+          from: { height: "var(--radix-accordion-content-height)" },
+          to: { height: "0" },
+        },
+      },
+      animation: {
+        "accordion-down": "accordion-down 0.2s ease-out",
+        "accordion-up": "accordion-up 0.2s ease-out",
+      },
+    },
+  },
+  plugins: [require("tailwindcss-animate")],
+} satisfies Config
+
+export default config`
+
+                ```
+
+                    packages/cli/src/utils/transformers/index.ts:
+                    ```
+import { promises as fs } from "fs"
+import { tmpdir } from "os"
+import path from "path"
+import { Config } from "@/src/utils/get-config"
+import { registryBaseColorSchema } from "@/src/utils/registry/schema"
+import { transformCssVars } from "@/src/utils/transformers/transform-css-vars"
+import { transformImport } from "@/src/utils/transformers/transform-import"
+import { transformJsx } from "@/src/utils/transformers/transform-jsx"
+import { transformRsc } from "@/src/utils/transformers/transform-rsc"
+import { Project, ScriptKind, type SourceFile } from "ts-morph"
+import { z } from "zod"
+
+import { transformTwPrefixes } from "./transform-tw-prefix"
+
+export type TransformOpts = {
+  filename: string
+  raw: string
+  config: Config
+  baseColor?: z.infer<typeof registryBaseColorSchema>
+}
+
+export type Transformer<Output = SourceFile> = (
+  opts: TransformOpts & {
+    sourceFile: SourceFile
+  }
+) => Promise<Output>
+
+const transformers: Transformer[] = [
+  transformImport,
+  transformRsc,
+  transformCssVars,
+  transformTwPrefixes,
+]
+
+const project = new Project({
+  compilerOptions: {},
+})
+
+async function createTempSourceFile(filename: string) {
+  const dir = await fs.mkdtemp(path.join(tmpdir(), "shadcn-"))
+  return path.join(dir, filename)
+}
+
+export async function transform(opts: TransformOpts) {
+  const tempFile = await createTempSourceFile(opts.filename)
+  const sourceFile = project.createSourceFile(tempFile, opts.raw, {
+    scriptKind: ScriptKind.TSX,
+  })
+
+  for (const transformer of transformers) {
+    transformer({ sourceFile, ...opts })
+  }
+
+  return await transformJsx({
+    sourceFile,
+    ...opts,
+  })
+}
+
+                    ```
+
+                    packages/cli/src/utils/transformers/transform-css-vars.ts:
+                    ```
+import { registryBaseColorSchema } from "@/src/utils/registry/schema"
+import { Transformer } from "@/src/utils/transformers"
+import { ScriptKind, SyntaxKind } from "ts-morph"
+import { z } from "zod"
+
+export const transformCssVars: Transformer = async ({
+  sourceFile,
+  config,
+  baseColor,
+}) => {
+  // No transform if using css variables.
+  if (config.tailwind?.cssVariables || !baseColor?.inlineColors) {
+    return sourceFile
+  }
+
+  // Find jsx attributes with the name className.
+  // const openingElements = sourceFile.getDescendantsOfKind(SyntaxKind.JsxElement)
+  // console.log(openingElements)
+  // const jsxAttributes = sourceFile
+  //   .getDescendantsOfKind(SyntaxKind.JsxAttribute)
+  //   .filter((node) => node.getName() === "className")
+
+  // for (const jsxAttribute of jsxAttributes) {
+  //   const value = jsxAttribute.getInitializer()?.getText()
+  //   if (value) {
+  //     const valueWithColorMapping = applyColorMapping(
+  //       value.replace(/"/g, ""),
+  //       baseColor.inlineColors
+  //     )
+  //     jsxAttribute.setInitializer(`"${valueWithColorMapping}"`)
+  //   }
+  // }
+  sourceFile.getDescendantsOfKind(SyntaxKind.StringLiteral).forEach((node) => {
+    const value = node.getText()
+    if (value) {
+      const valueWithColorMapping = applyColorMapping(
+        value.replace(/"/g, ""),
+        baseColor.inlineColors
+      )
+      node.replaceWithText(`"${valueWithColorMapping.trim()}"`)
+    }
+  })
+
+  return sourceFile
+}
+
+// export default function transformer(file: FileInfo, api: API) {
+//   const j = api.jscodeshift.withParser("tsx")
+
+//   // Replace bg-background with "bg-white dark:bg-slate-950"
+//   const $j = j(file.source)
+//   return $j
+//     .find(j.JSXAttribute, {
+//       name: {
+//         name: "className",
+//       },
+//     })
+//     .forEach((path) => {
+//       const { node } = path
+//       if (node?.value?.type) {
+//         if (node.value.type === "StringLiteral") {
+//           node.value.value = applyColorMapping(node.value.value)
+//           console.log(node.value.value)
+//         }
+
+//         if (
+//           node.value.type === "JSXExpressionContainer" &&
+//           node.value.expression.type === "CallExpression"
+//         ) {
+//           const callee = node.value.expression.callee
+//           if (callee.type === "Identifier" && callee.name === "cn") {
+//             node.value.expression.arguments.forEach((arg) => {
+//               if (arg.type === "StringLiteral") {
+//                 arg.value = applyColorMapping(arg.value)
+//               }
+
+//               if (
+//                 arg.type === "LogicalExpression" &&
+//                 arg.right.type === "StringLiteral"
+//               ) {
+//                 arg.right.value = applyColorMapping(arg.right.value)
+//               }
+//             })
+//           }
+//         }
+//       }
+//     })
+//     .toSource()
+// }
+
+// // export function splitClassName(input: string): (string | null)[] {
+// //   const parts = input.split(":")
+// //   const classNames = parts.map((part) => {
+// //     const match = part.match(/^\[?(.+)\]$/)
+// //     if (match) {
+// //       return match[1]
+// //     } else {
+// //       return null
+// //     }
+// //   })
+
+// //   return classNames
+// // }
+
+// Splits a className into variant-name-alpha.
+// eg. hover:bg-primary-100 -> [hover, bg-primary, 100]
+export function splitClassName(className: string): (string | null)[] {
+  if (!className.includes("/") && !className.includes(":")) {
+    return [null, className, null]
+  }
+
+  const parts: (string | null)[] = []
+  // First we split to find the alpha.
+  let [rest, alpha] = className.split("/")
+
+  // Check if rest has a colon.
+  if (!rest.includes(":")) {
+    return [null, rest, alpha]
+  }
+
+  // Next we split the rest by the colon.
+  const split = rest.split(":")
+
+  // We take the last item from the split as the name.
+  const name = split.pop()
+
+  // We glue back the rest of the split.
+  const variant = split.join(":")
+
+  // Finally we push the variant, name and alpha.
+  parts.push(variant ?? null, name ?? null, alpha ?? null)
+
+  return parts
+}
+
+const PREFIXES = ["bg-", "text-", "border-", "ring-offset-", "ring-"]
+
+export function applyColorMapping(
+  input: string,
+  mapping: z.infer<typeof registryBaseColorSchema>["inlineColors"]
+) {
+  // Handle border classes.
+  if (input.includes(" border ")) {
+    input = input.replace(" border ", " border border-border ")
+  }
+
+  // Build color mappings.
+  const classNames = input.split(" ")
+  const lightMode = new Set<string>()
+  const darkMode = new Set<string>()
+  for (let className of classNames) {
+    const [variant, value, modifier] = splitClassName(className)
+    const prefix = PREFIXES.find((prefix) => value?.startsWith(prefix))
+    if (!prefix) {
+      if (!lightMode.has(className)) {
+        lightMode.add(className)
+      }
+      continue
+    }
+
+    const needle = value?.replace(prefix, "")
+    if (needle && needle in mapping.light) {
+      lightMode.add(
+        [variant, `${prefix}${mapping.light[needle]}`]
+          .filter(Boolean)
+          .join(":") + (modifier ? `/${modifier}` : "")
+      )
+
+      darkMode.add(
+        ["dark", variant, `${prefix}${mapping.dark[needle]}`]
+          .filter(Boolean)
+          .join(":") + (modifier ? `/${modifier}` : "")
+      )
+      continue
+    }
+
+    if (!lightMode.has(className)) {
+      lightMode.add(className)
+    }
+  }
+
+  return [...Array.from(lightMode), ...Array.from(darkMode)].join(" ").trim()
+}
+
+                    ```
+
+                    packages/cli/src/utils/transformers/transform-import.ts:
+                    ```
+import { Transformer } from "@/src/utils/transformers"
+
+export const transformImport: Transformer = async ({ sourceFile, config }) => {
+  const importDeclarations = sourceFile.getImportDeclarations()
+
+  for (const importDeclaration of importDeclarations) {
+    const moduleSpecifier = importDeclaration.getModuleSpecifierValue()
+
+    // Replace @/registry/[style] with the components alias.
+    if (moduleSpecifier.startsWith("@/registry/")) {
+      if (config.aliases.ui) {
+        importDeclaration.setModuleSpecifier(
+          moduleSpecifier.replace(/^@\/registry\/[^/]+\/ui/, config.aliases.ui)
+        )
+      } else {
+        importDeclaration.setModuleSpecifier(
+          moduleSpecifier.replace(
+            /^@\/registry\/[^/]+/,
+            config.aliases.components
+          )
+        )
+      }
+    }
+
+    // Replace `import { cn } from "@/lib/utils"`
+    if (moduleSpecifier == "@/lib/utils") {
+      const namedImports = importDeclaration.getNamedImports()
+      const cnImport = namedImports.find((i) => i.getName() === "cn")
+      if (cnImport) {
+        importDeclaration.setModuleSpecifier(
+          moduleSpecifier.replace(/^@\/lib\/utils/, config.aliases.utils)
+        )
+      }
+    }
+  }
+
+  return sourceFile
+}
+
+                    ```
+
+                    packages/cli/src/utils/transformers/transform-jsx.ts:
+                    ```
+import { type Transformer } from "@/src/utils/transformers"
+import { transformFromAstSync } from "@babel/core"
+import { ParserOptions, parse } from "@babel/parser"
+// @ts-ignore
+import transformTypescript from "@babel/plugin-transform-typescript"
+import * as recast from "recast"
+
+// TODO.
+// I'm using recast for the AST here.
+// Figure out if ts-morph AST is compatible with Babel.
+
+// This is a copy of the babel options from recast/parser.
+// The goal here is to tolerate as much syntax as possible.
+// We want to be able to parse any valid tsx code.
+// See https://github.com/benjamn/recast/blob/master/parsers/_babel_options.ts.
+const PARSE_OPTIONS: ParserOptions = {
+  sourceType: "module",
+  allowImportExportEverywhere: true,
+  allowReturnOutsideFunction: true,
+  startLine: 1,
+  tokens: true,
+  plugins: [
+    "asyncGenerators",
+    "bigInt",
+    "classPrivateMethods",
+    "classPrivateProperties",
+    "classProperties",
+    "classStaticBlock",
+    "decimal",
+    "decorators-legacy",
+    "doExpressions",
+    "dynamicImport",
+    "exportDefaultFrom",
+    "exportNamespaceFrom",
+    "functionBind",
+    "functionSent",
+    "importAssertions",
+    "importMeta",
+    "nullishCoalescingOperator",
+    "numericSeparator",
+    "objectRestSpread",
+    "optionalCatchBinding",
+    "optionalChaining",
+    [
+      "pipelineOperator",
+      {
+        proposal: "minimal",
+      },
+    ],
+    [
+      "recordAndTuple",
+      {
+        syntaxType: "hash",
+      },
+    ],
+    "throwExpressions",
+    "topLevelAwait",
+    "v8intrinsic",
+    "typescript",
+    "jsx",
+  ],
+}
+
+export const transformJsx: Transformer<String> = async ({
+  sourceFile,
+  config,
+}) => {
+  const output = sourceFile.getFullText()
+
+  if (config.tsx) {
+    return output
+  }
+
+  const ast = recast.parse(output, {
+    parser: {
+      parse: (code: string) => {
+        return parse(code, PARSE_OPTIONS)
+      },
+    },
+  })
+
+  const result = transformFromAstSync(ast, output, {
+    cloneInputAst: false,
+    code: false,
+    ast: true,
+    plugins: [transformTypescript],
+    configFile: false,
+  })
+
+  if (!result || !result.ast) {
+    throw new Error("Failed to transform JSX")
+  }
+
+  return recast.print(result.ast).code
+}
+
+                    ```
+
+                    packages/cli/src/utils/transformers/transform-rsc.ts:
+                    ```
+import { Transformer } from "@/src/utils/transformers"
+import { SyntaxKind } from "ts-morph"
+
+export const transformRsc: Transformer = async ({ sourceFile, config }) => {
+  if (config.rsc) {
+    return sourceFile
+  }
+
+  // Remove "use client" from the top of the file.
+  const first = sourceFile.getFirstChildByKind(SyntaxKind.ExpressionStatement)
+  if (first?.getText() === `"use client"`) {
+    first.remove()
+  }
+
+  return sourceFile
+}
+
+                    ```
+
+                    packages/cli/src/utils/transformers/transform-tw-prefix.ts:
+                    ```
+import { Transformer } from "@/src/utils/transformers"
+import { SyntaxKind } from "ts-morph"
+
+import { splitClassName } from "./transform-css-vars"
+
+export const transformTwPrefixes: Transformer = async ({
+  sourceFile,
+  config,
+}) => {
+  if (!config.tailwind?.prefix) {
+    return sourceFile
+  }
+
+  // Find the cva function calls.
+  sourceFile
+    .getDescendantsOfKind(SyntaxKind.CallExpression)
+    .filter((node) => node.getExpression().getText() === "cva")
+    .forEach((node) => {
+      // cva(base, ...)
+      if (node.getArguments()[0]?.isKind(SyntaxKind.StringLiteral)) {
+        const defaultClassNames = node.getArguments()[0]
+        if (defaultClassNames) {
+          defaultClassNames.replaceWithText(
+            `"${applyPrefix(
+              defaultClassNames.getText()?.replace(/"/g, ""),
+              config.tailwind.prefix
+            )}"`
+          )
+        }
+      }
+
+      // cva(..., { variants: { ... } })
+      if (node.getArguments()[1]?.isKind(SyntaxKind.ObjectLiteralExpression)) {
+        node
+          .getArguments()[1]
+          ?.getDescendantsOfKind(SyntaxKind.PropertyAssignment)
+          .find((node) => node.getName() === "variants")
+          ?.getDescendantsOfKind(SyntaxKind.PropertyAssignment)
+          .forEach((node) => {
+            node
+              .getDescendantsOfKind(SyntaxKind.PropertyAssignment)
+              .forEach((node) => {
+                const classNames = node.getInitializerIfKind(
+                  SyntaxKind.StringLiteral
+                )
+                if (classNames) {
+                  classNames?.replaceWithText(
+                    `"${applyPrefix(
+                      classNames.getText()?.replace(/"/g, ""),
+                      config.tailwind.prefix
+                    )}"`
+                  )
+                }
+              })
+          })
+      }
+    })
+
+  // Find all jsx attributes with the name className.
+  sourceFile.getDescendantsOfKind(SyntaxKind.JsxAttribute).forEach((node) => {
+    if (node.getName() === "className") {
+      // className="..."
+      if (node.getInitializer()?.isKind(SyntaxKind.StringLiteral)) {
+        const value = node.getInitializer()
+        if (value) {
+          value.replaceWithText(
+            `"${applyPrefix(
+              value.getText()?.replace(/"/g, ""),
+              config.tailwind.prefix
+            )}"`
+          )
+        }
+      }
+
+      // className={...}
+      if (node.getInitializer()?.isKind(SyntaxKind.JsxExpression)) {
+        // Check if it's a call to cn().
+        const callExpression = node
+          .getInitializer()
+          ?.getDescendantsOfKind(SyntaxKind.CallExpression)
+          .find((node) => node.getExpression().getText() === "cn")
+        if (callExpression) {
+          // Loop through the arguments.
+          callExpression.getArguments().forEach((node) => {
+            if (
+              node.isKind(SyntaxKind.ConditionalExpression) ||
+              node.isKind(SyntaxKind.BinaryExpression)
+            ) {
+              node
+                .getChildrenOfKind(SyntaxKind.StringLiteral)
+                .forEach((node) => {
+                  node.replaceWithText(
+                    `"${applyPrefix(
+                      node.getText()?.replace(/"/g, ""),
+                      config.tailwind.prefix
+                    )}"`
+                  )
+                })
+            }
+
+            if (node.isKind(SyntaxKind.StringLiteral)) {
+              node.replaceWithText(
+                `"${applyPrefix(
+                  node.getText()?.replace(/"/g, ""),
+                  config.tailwind.prefix
+                )}"`
+              )
+            }
+          })
+        }
+      }
+    }
+
+    // classNames={...}
+    if (node.getName() === "classNames") {
+      if (node.getInitializer()?.isKind(SyntaxKind.JsxExpression)) {
+        node
+          .getDescendantsOfKind(SyntaxKind.PropertyAssignment)
+          .forEach((node) => {
+            if (node.getInitializer()?.isKind(SyntaxKind.CallExpression)) {
+              const callExpression = node.getInitializerIfKind(
+                SyntaxKind.CallExpression
+              )
+              if (callExpression) {
+                // Loop through the arguments.
+                callExpression.getArguments().forEach((arg) => {
+                  if (arg.isKind(SyntaxKind.ConditionalExpression)) {
+                    arg
+                      .getChildrenOfKind(SyntaxKind.StringLiteral)
+                      .forEach((node) => {
+                        node.replaceWithText(
+                          `"${applyPrefix(
+                            node.getText()?.replace(/"/g, ""),
+                            config.tailwind.prefix
+                          )}"`
+                        )
+                      })
+                  }
+
+                  if (arg.isKind(SyntaxKind.StringLiteral)) {
+                    arg.replaceWithText(
+                      `"${applyPrefix(
+                        arg.getText()?.replace(/"/g, ""),
+                        config.tailwind.prefix
+                      )}"`
+                    )
+                  }
+                })
+              }
+            }
+
+            if (node.getInitializer()?.isKind(SyntaxKind.StringLiteral)) {
+              if (node.getName() !== "variant") {
+                const classNames = node.getInitializer()
+                if (classNames) {
+                  classNames.replaceWithText(
+                    `"${applyPrefix(
+                      classNames.getText()?.replace(/"/g, ""),
+                      config.tailwind.prefix
+                    )}"`
+                  )
+                }
+              }
+            }
+          })
+      }
+    }
+  })
+
+  return sourceFile
+}
+
+export function applyPrefix(input: string, prefix: string = "") {
+  const classNames = input.split(" ")
+  const prefixed: string[] = []
+  for (let className of classNames) {
+    const [variant, value, modifier] = splitClassName(className)
+    if (variant) {
+      modifier
+        ? prefixed.push(`${variant}:${prefix}${value}/${modifier}`)
+        : prefixed.push(`${variant}:${prefix}${value}`)
+    } else {
+      modifier
+        ? prefixed.push(`${prefix}${value}/${modifier}`)
+        : prefixed.push(`${prefix}${value}`)
+    }
+  }
+  return prefixed.join(" ")
+}
+
+export function applyPrefixesCss(css: string, prefix: string) {
+  const lines = css.split("\n")
+  for (let line of lines) {
+    if (line.includes("@apply")) {
+      const originalTWCls = line.replace("@apply", "").trim()
+      const prefixedTwCls = applyPrefix(originalTWCls, prefix)
+      css = css.replace(originalTWCls, prefixedTwCls)
+    }
+  }
+  return css
+}
+                ```
+
+        packages/cli/tsup.config.ts:
+        ```
+import { defineConfig } from "tsup"
+
+export default defineConfig({
+  clean: true,
+  dts: true,
+  entry: ["src/index.ts"],
+  format: ["esm"],
+  sourcemap: true,
+  minify: true,
+  target: "esnext",
+  outDir: "dist",
+})
