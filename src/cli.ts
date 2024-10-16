@@ -1,8 +1,11 @@
 import { Command } from "commander";
-import { getPackageInfo } from "./utils/get-package-info.js";
 import { add } from "./commands/add.js";
 import { init } from "./commands/init.js";
 import { list } from "./commands/list.js";
+import { getPackageInfo } from "./utils/get-package-info.js";
+
+process.on("SIGINT", () => process.exit(0));
+process.on("SIGTERM", () => process.exit(0));
 
 async function main() {
     const packageInfo = await getPackageInfo();
